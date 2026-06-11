@@ -1,0 +1,4 @@
+WiFi
+PubSubClient
+LiquidCrystal I2C
+ArduinoJson

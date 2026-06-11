@@ -1,0 +1,161 @@
+Wokwi (ESP32) tidak bisa mendengarkan HTTP POST secara langsung dari Python jika keduanya tidak berada dalam satu jaringan lokal yang benar-benar terbuka, atau tanpa port forwarding. Wokwi berada di cloud (internet), sedangkan Python Anda mengirim ke IP lokal (192.168.12.189).
+
+Oleh karena itu, agar prototipe LCD dan LED di Wokwi tetap bisa berjalan dan mensimulasikan "papan informasi", kita harus mengembalikan fungsi MQTT sebagai jembatan komunikasi antara Python dan Wokwi, tanpa mengganggu pengiriman data HTTP POST ke Next.js.
+
+Berikut adalah kode Wokwi (C++) yang sudah disesuaikan persis dengan format data JSON (slot_1, slot_2, slot_3, available_slots) yang ada di file main.py Anda.
+
+Kode Program ESP32 (sketch.ino) di Wokwi
+Gunakan hardware configuration (diagram.json) yang sama dengan sebelumnya (menggunakan LCD dan 3 LED). Paste kode ini ke tab sketch.ino:
+
+C++
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <LiquidCrystal_I2C.h>
+#include <ArduinoJson.h>
+
+// --- Konfigurasi Jaringan & MQTT ---
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+const char* mqtt_server = "broker.hivemq.com";
+// Topik ini HARUS ditambahkan juga di skrip Python Anda
+const char* mqtt_topic = "garisawan/parking/display"; 
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Pin LED Indikator
+const int ledSlot1 = 13;
+const int ledSlot2 = 12;
+const int ledSlot3 = 14;
+
+void setup_wifi() {
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  lcd.clear();
+  lcd.print("WiFi Connected!");
+  delay(1000);
+}
+
+// Fungsi penerima pesan dari Python via MQTT
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.println("Pesan Masuk (JSON): " + message);
+
+  // Parsing JSON (Disamakan dengan payload di main.py)
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, message);
+
+  if (error) {
+    Serial.print("Gagal parsing JSON: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  // Menyesuaikan dengan keys yang dikirim oleh main.py
+  int slot1 = doc["slot_1"];
+  int slot2 = doc["slot_2"];
+  int slot3 = doc["slot_3"];
+  int available = doc["available_slots"];
+
+  // Update LED (Menyala jika terisi/1)
+  digitalWrite(ledSlot1, slot1 == 1 ? HIGH : LOW);
+  digitalWrite(ledSlot2, slot2 == 1 ? HIGH : LOW);
+  digitalWrite(ledSlot3, slot3 == 1 ? HIGH : LOW);
+
+  // Update LCD Display
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Slot Kosong: "); 
+  lcd.print(available);
+  lcd.setCursor(0, 1);
+  lcd.print(slot1 ? "[X]" : "[ ]");
+  lcd.print(slot2 ? "[X]" : "[ ]");
+  lcd.print(slot3 ? "[X]" : "[ ]");
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Menghubungkan ke MQTT...");
+    String clientId = "ESP32Display-" + String(random(0, 0xffff), HEX);
+    
+    if (client.connect(clientId.c_str())) {
+      Serial.println("Terhubung!");
+      // Wajib subscribe agar bisa menerima data
+      client.subscribe(mqtt_topic); 
+    } else {
+      Serial.print("Gagal, status=");
+      Serial.print(client.state());
+      Serial.println(" Coba lagi dalam 5 detik");
+      delay(5000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(ledSlot1, OUTPUT);
+  pinMode(ledSlot2, OUTPUT);
+  pinMode(ledSlot3, OUTPUT);
+  
+  lcd.init();
+  lcd.backlight();
+  
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop(); 
+}
+Tindakan yang Wajib Anda Lakukan di Python (main.py)
+Agar Wokwi bisa menyala, Anda harus memodifikasi sedikit saja file main.py Anda. Anda harus mengirimkan payload JSON yang sama ke MQTT, bersamaan dengan pengiriman ke API Next.js Anda.
+
+Buka terminal laptop, install library MQTT: pip install paho-mqtt
+
+Tambahkan import di bagian paling atas main.py:
+
+Python
+import paho.mqtt.client as mqtt
+Tambahkan konfigurasi koneksi MQTT (letakkan di bawah WEBHOOK_URL):
+
+Python
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_TOPIC = "garisawan/parking/display"
+mqtt_client = mqtt.Client()
+mqtt_client.connect(MQTT_BROKER, 1883, 60)
+mqtt_client.loop_start()
+Di dalam fungsi send_data_to_webhook(payload), tambahkan pengiriman ke MQTT:
+
+Python
+def send_data_to_webhook(payload):
+    try:
+        # Pengiriman eksisting ke Next.js API
+        response = requests.post(WEBHOOK_URL, json=payload, headers={"Content-Type": "application/json"})
+
+        # ---- TAMBAHKAN BARIS INI UNTUK WOKWI ----
+        mqtt_client.publish(MQTT_TOPIC, json.dumps(payload))
+        # -----------------------------------------
+
+        if response.status_code == 200:
+            print("✅ Data berhasil dikirim ke Webhook & Wokwi:", payload)
+        # ... (sisa kode Anda)
+Dengan cara ini, skrip Python Anda menjadi sistem distribusi ganda (Dual Dispatch):
+
+Data mengalir ke Local Server (192.168.12.189) untuk analytics dashboard.
+
+Data juga mengalir ke Cloud MQTT (HiveMQ) yang kemudian ditangkap oleh simulasi ESP32 di Wokwi untuk menyalakan lampu indikator.
